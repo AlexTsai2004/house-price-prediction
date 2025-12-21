@@ -1,0 +1,12 @@
+# 資料檔（依 data/README.md 自行下載）
+*.csv
+!taipei/results/*.csv
+
+# Python / Jupyter
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# 系統檔
+.DS_Store
+Thumbs.db

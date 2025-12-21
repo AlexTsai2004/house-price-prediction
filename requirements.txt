@@ -1,0 +1,8 @@
+pandas
+numpy
+scikit-learn
+matplotlib
+seaborn
+# Ames notebooks
+tensorflow
+tensorflow_decision_forests
