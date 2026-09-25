@@ -1,260 +1,151 @@
-import pandas as pd
-import numpy as np
-from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-import matplotlib.pyplot as plt
-import seaborn as sns
+"""
+台北住宅房價 Random Forest（修正版）
 
+與課程繳交版本（`original` 分支）的差異：
+1. 行政區 Target Encoding 改在切分之後、只用訓練集計算（修正資料洩漏）。
+2. 類別特徵以 OrdinalEncoder 在訓練集上 fit，測試集未見類別編為 -1；
+   判斷類別欄位不再依賴 dtype == 'object'（新版 pandas 會漏掉類別特徵）。
+3. 誤差指標修正：原版的「平均誤差 %」是有正負號的平均，高估與低估互相抵銷。
+   修正版回報 MAPE（平均絕對百分比誤差）與中位數絕對百分比誤差，
+   有正負號的平均另外標示為「偏差」。
+4. 除原本的隨機切分外，增加時間切分驗證：以 113 年以前的交易訓練、
+   114 年的交易測試，較接近「預測未來成交價」的實際情境。
+5. 圖表改存成檔案；模型超參數與原版相同。
+"""
+import json
+from pathlib import Path
+
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-plt.rcParams['font.sans-serif'] = ['Microsoft JhengHei', 'DejaVu Sans']  
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import OrdinalEncoder
+
+HERE = Path(__file__).parent
+DATA = HERE / '所有住家用資料_特徵處理後.csv'
+RESULTS = HERE / 'results'
+RESULTS.mkdir(exist_ok=True)
+
+plt.rcParams['font.sans-serif'] = ['Microsoft JhengHei', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
 
-# 讀取處理後的資料
-df = pd.read_csv('所有住家用資料_特徵處理後.csv')
-print(f"資料形狀: {df.shape}")
-
-# 1. 準備特徵和目標變數
-# 目標變數：對數轉換後的總價
-y = df['總價元_log']
-
-# 特徵選擇：使用您指定的所有特徵
-# 先列出所有可能的特徵
-all_features = [
-    # 數值特徵
-    '主建物面積',
-    '建物現況格局-房', '建物現況格局-廳', '建物現況格局-衛',
-    '車位移轉總面積平方公尺',  '附屬建物面積', 
-    '陽台面積', '屋齡_年', '鄉鎮市區_target_encoded',
-    
-    # 布林特徵（已轉換）
-    '有無管理組織', '建物現況格局-隔間', '電梯',
-    
-    # 備註關鍵詞特徵
-    '備註_親友', '備註_員工', '備註_共有人', '備註_特殊關係',
-    '備註_陽台外推', '備註_夾層', '備註_頂樓加蓋', '備註_其他增建',
-    '備註_車位交易', '備註_僅車位', '備註_僅建物', '備註_部分移轉',
-    '備註_租約', '備註_含租約', '備註_裝潢費', '備註_傢俱設備費',
-    '備註_急買急賣', '備註_債務', '備註_債權債務', '備註_畸零地',
-    '備註_二親等', '備註_叔侄', '備註_直系',
-    
-    # 類別特徵（需要編碼）
-    '交易標的', '都市土地使用分區', '主要建材', '建物型態', '車位類別'
+NUMERIC = [
+    '主建物面積', '建物現況格局-房', '建物現況格局-廳', '建物現況格局-衛',
+    '車位移轉總面積平方公尺', '附屬建物面積', '陽台面積', '屋齡_年',
 ]
-
-# 只選擇存在於資料中的特徵
-available_features = [col for col in all_features if col in df.columns]
-print(f"可用的特徵數量: {len(available_features)}")
-
-# 分離數值/布林特徵和類別特徵
-numeric_bool_features = [
-    col for col in available_features 
-    if df[col].dtype in ['int64', 'float64', 'bool']
+BOOLEAN = ['有無管理組織', '建物現況格局-隔間', '電梯']
+KEYWORDS = [
+    '親友', '員工', '共有人', '特殊關係', '陽台外推', '夾層', '頂樓加蓋', '其他增建',
+    '車位交易', '僅車位', '僅建物', '部分移轉', '租約', '含租約', '裝潢費', '傢俱設備費',
+    '急買急賣', '債務', '債權債務', '畸零地', '二親等', '叔侄', '直系',
 ]
+REMARK = [f'備註_{k}' for k in KEYWORDS]
+CATEGORICAL = ['交易標的', '都市土地使用分區', '主要建材', '建物型態', '車位類別']
+TARGET = '總價元_log'
+DISTRICT_ENC = '鄉鎮市區_target_encoded'
 
-categorical_features = [
-    col for col in available_features 
-    if df[col].dtype == 'object'
-]
+RF_PARAMS = dict(n_estimators=100, max_depth=10, min_samples_split=5,
+                 min_samples_leaf=2, random_state=42, n_jobs=-1)
 
-print(f"數值/布林特徵: {len(numeric_bool_features)} 個")
-print(f"類別特徵: {len(categorical_features)} 個")
 
-# 2. 處理類別特徵 - 使用Label Encoding
-X_numeric = df[numeric_bool_features].copy()
+def build_features(df, train_idx, test_idx):
+    """所有需要學習的轉換都只在訓練集上 fit。"""
+    X = pd.DataFrame(index=df.index)
+    for c in NUMERIC + REMARK:
+        X[c] = pd.to_numeric(df[c], errors='coerce')
+    for c in BOOLEAN:
+        X[c] = df[c].map({True: 1, False: 0, 'True': 1, 'False': 0})
 
-# 對布林特徵轉換為0/1
-bool_columns = ['有無管理組織', '建物現況格局-隔間', '電梯']
-for col in bool_columns:
-    if col in X_numeric.columns:
-        X_numeric[col] = X_numeric[col].astype(int)
+    # 行政區 Target Encoding：只用訓練集的平均單價
+    train = df.loc[train_idx]
+    region_mean = train.groupby('鄉鎮市區')['單價元平方公尺'].mean()
+    overall = train['單價元平方公尺'].mean()
+    X[DISTRICT_ENC] = df['鄉鎮市區'].map(region_mean).fillna(overall)
 
-# 處理類別特徵
-X_encoded = pd.DataFrame()
-label_encoders = {}
+    enc = OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1)
+    enc.fit(df.loc[train_idx, CATEGORICAL].fillna('一般').astype(str))
+    X[CATEGORICAL] = enc.transform(df[CATEGORICAL].fillna('一般').astype(str))
+    return X.loc[train_idx], X.loc[test_idx]
 
-for col in categorical_features:
-    if col in df.columns:
-        le = LabelEncoder()
-        # 處理缺失值
-        temp_col = df[col].fillna('一般')
-        X_encoded[col] = le.fit_transform(temp_col)
-        label_encoders[col] = le
-        print(f"已編碼 {col}: {len(le.classes_)} 個類別")
 
-# 合併所有特徵
-X = pd.concat([X_numeric, X_encoded], axis=1)
+def metrics(y_log, p_log):
+    y, p = np.expm1(y_log), np.expm1(p_log)
+    ape = np.abs(p - y) / y * 100
+    return {
+        'R2_log': round(float(r2_score(y_log, p_log)), 4),
+        'R2_price': round(float(r2_score(y, p)), 4),
+        'MAE_元': int(round(mean_absolute_error(y, p))),
+        'RMSE_元': int(round(np.sqrt(mean_squared_error(y, p)))),
+        'MAPE_%': round(float(ape.mean()), 1),
+        'MedianAPE_%': round(float(np.median(ape)), 1),
+        '偏差_有正負號平均_%': round(float(((p - y) / y * 100).mean()), 1),
+        '誤差10%以內比例_%': round(float((ape <= 10).mean() * 100), 1),
+    }
 
-print(f"\n最終特徵矩陣形狀: {X.shape}")
-print(f"目標變數形狀: {y.shape}")
 
-# 3. 分割訓練集和測試集
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.2, random_state=42
-)
-print(f"\n訓練集大小: {X_train.shape}")
-print(f"測試集大小: {X_test.shape}")
+def run(df, train_idx, test_idx, tag):
+    Xtr, Xte = build_features(df, train_idx, test_idx)
+    ytr, yte = df.loc[train_idx, TARGET], df.loc[test_idx, TARGET]
+    model = RandomForestRegressor(**RF_PARAMS).fit(Xtr, ytr)
+    res = {
+        'split': tag,
+        'n_train': len(Xtr), 'n_test': len(Xte), 'n_features': Xtr.shape[1],
+        'train': metrics(ytr, model.predict(Xtr)),
+        'test': metrics(yte, model.predict(Xte)),
+    }
+    imp = pd.Series(model.feature_importances_, index=Xtr.columns).sort_values(ascending=False)
+    res['top10_importance'] = {k: round(float(v), 3) for k, v in imp.head(10).items()}
+    return res, model, Xte, yte
 
-# 4. 建立和訓練Random Forest模型
-print("\n訓練Random Forest模型...")
-rf_model = RandomForestRegressor(
-    n_estimators=100,  # 樹的數量
-    max_depth=10,      # 最大深度
-    min_samples_split=5,  # 最小分割樣本數
-    min_samples_leaf=2,   # 葉節點最小樣本數
-    random_state=42,
-    n_jobs=-1  # 使用所有CPU核心
-)
 
-rf_model.fit(X_train, y_train)
-print("模型訓練完成！")
+def plot(model, Xte, yte, tag, fname):
+    p = model.predict(Xte)
+    y_o, p_o = np.expm1(yte), np.expm1(p)
+    ape = np.abs(p_o - y_o) / y_o * 100
+    fig, ax = plt.subplots(1, 3, figsize=(16, 4.5))
+    ax[0].scatter(yte, p, s=4, alpha=0.4)
+    lo, hi = yte.min(), yte.max()
+    ax[0].plot([lo, hi], [lo, hi], 'r--')
+    ax[0].set(xlabel='實際 log(總價)', ylabel='預測 log(總價)', title=f'{tag}：預測 vs 實際')
+    ax[1].scatter(p, yte - p, s=4, alpha=0.4)
+    ax[1].axhline(0, color='r', ls='--')
+    ax[1].set(xlabel='預測 log(總價)', ylabel='殘差', title='殘差圖')
+    ax[2].hist(np.clip(ape, 0, 100), bins=50, edgecolor='black', alpha=0.7)
+    ax[2].axvline(np.median(ape), color='r', ls='--', label=f'中位數 {np.median(ape):.1f}%')
+    ax[2].set(xlabel='絕對百分比誤差 %（>100% 併入 100）', ylabel='筆數', title='絕對百分比誤差分布')
+    ax[2].legend()
+    plt.tight_layout()
+    plt.savefig(RESULTS / fname, dpi=150)
+    plt.close(fig)
 
-# 5. 模型評估
-print("\n模型評估:")
-# 預測
-y_pred_train = rf_model.predict(X_train)
-y_pred_test = rf_model.predict(X_test)
 
-# 將預測值轉回原始尺度（對數逆轉換）
-y_train_original = np.expm1(y_train)
-y_test_original = np.expm1(y_test)
-y_pred_train_original = np.expm1(y_pred_train)
-y_pred_test_original = np.expm1(y_pred_test)
+def main():
+    df = pd.read_csv(DATA, low_memory=False)
+    print(f'資料形狀: {df.shape}')
 
-# 計算指標（對數尺度）
-print("對數尺度指標:")
-print(f"訓練集 R²: {r2_score(y_train, y_pred_train):.4f}")
-print(f"測試集 R²: {r2_score(y_test, y_pred_test):.4f}")
-print(f"訓練集 RMSE: {np.sqrt(mean_squared_error(y_train, y_pred_train)):.4f}")
-print(f"測試集 RMSE: {np.sqrt(mean_squared_error(y_test, y_pred_test)):.4f}")
+    # A. 隨機切分（與原版相同：80/20、random_state=42）
+    tr, te = train_test_split(df.index, test_size=0.2, random_state=42)
+    res_random, m, Xte, yte = run(df, tr, te, '隨機切分 80/20')
+    plot(m, Xte, yte, '隨機切分', '隨機切分_預測結果.png')
 
-print("\n原始尺度指標:")
-print(f"訓練集 R²: {r2_score(y_train_original, y_pred_train_original):.4f}")
-print(f"測試集 R²: {r2_score(y_test_original, y_pred_test_original):.4f}")
-print(f"訓練集 MAE: {mean_absolute_error(y_train_original, y_pred_train_original):,.0f} 元")
-print(f"測試集 MAE: {mean_absolute_error(y_test_original, y_pred_test_original):,.0f} 元")
-print(f"訓練集 RMSE: {np.sqrt(mean_squared_error(y_train_original, y_pred_train_original)):,.0f} 元")
-print(f"測試集 RMSE: {np.sqrt(mean_squared_error(y_test_original, y_pred_test_original)):,.0f} 元")
+    # B. 時間切分：113 年以前訓練、114 年測試
+    year = pd.to_numeric(df['交易年月日_民國年'], errors='coerce')
+    tr_t, te_t = df.index[year <= 113], df.index[year == 114]
+    res_time, m_t, Xte_t, yte_t = run(df, tr_t, te_t, '時間切分 ≤113年 訓練 / 114年 測試')
+    plot(m_t, Xte_t, yte_t, '時間切分', '時間切分_預測結果.png')
 
-# 6. 特徵重要性分析
-print("\n特徵重要性分析 (Top 20):")
-feature_importance = pd.DataFrame({
-    'feature': X.columns,
-    'importance': rf_model.feature_importances_
-}).sort_values('importance', ascending=False)
+    out = {'random_split': res_random, 'time_split': res_time}
+    (RESULTS / 'metrics.json').write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding='utf-8')
+    for r in (res_random, res_time):
+        print(f"\n== {r['split']}  train {r['n_train']} / test {r['n_test']}  features {r['n_features']}")
+        print('  train:', r['train'])
+        print('  test :', r['test'])
+        print('  top10:', r['top10_importance'])
 
-print(feature_importance.head(20))
 
-# 7. 可視化結果
-fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-
-# 1. 特徵重要性
-axes[0, 0].barh(feature_importance['feature'].head(15)[::-1], 
-                feature_importance['importance'].head(15)[::-1])
-axes[0, 0].set_title('Top 15 特徵重要性')
-axes[0, 0].set_xlabel('重要性')
-
-# 2. 預測 vs 實際值 (對數尺度)
-axes[0, 1].scatter(y_test, y_pred_test, alpha=0.5)
-axes[0, 1].plot([y_test.min(), y_test.max()], 
-                [y_test.min(), y_test.max()], 'r--', lw=2)
-axes[0, 1].set_xlabel('實際值 (log)')
-axes[0, 1].set_ylabel('預測值 (log)')
-axes[0, 1].set_title(f'預測 vs 實際 (測試集)\nR² = {r2_score(y_test, y_pred_test):.4f}')
-
-# 3. 殘差圖 (對數尺度)
-residuals = y_test - y_pred_test
-axes[0, 2].scatter(y_pred_test, residuals, alpha=0.5)
-axes[0, 2].axhline(y=0, color='r', linestyle='--')
-axes[0, 2].set_xlabel('預測值 (log)')
-axes[0, 2].set_ylabel('殘差 (log)')
-axes[0, 2].set_title('殘差圖')
-
-# 4. 預測 vs 實際值 (原始尺度)
-axes[1, 0].scatter(y_test_original, y_pred_test_original, alpha=0.5)
-axes[1, 0].plot([y_test_original.min(), y_test_original.max()], 
-                [y_test_original.min(), y_test_original.max()], 'r--', lw=2)
-axes[1, 0].set_xlabel('實際總價 (元)')
-axes[1, 0].set_ylabel('預測總價 (元)')
-axes[1, 0].set_title(f'預測 vs 實際 (原始尺度)\nR² = {r2_score(y_test_original, y_pred_test_original):.4f}')
-
-# 5. 誤差分布
-error_percentage = ((y_pred_test_original - y_test_original) / y_test_original) * 100
-axes[1, 1].hist(error_percentage, bins=50, edgecolor='black', alpha=0.7)
-axes[1, 1].axvline(x=0, color='r', linestyle='--')
-axes[1, 1].set_xlabel('預測誤差百分比 (%)')
-axes[1, 1].set_ylabel('頻率')
-axes[1, 1].set_title(f'預測誤差分布\n平均誤差: {error_percentage.mean():.1f}%')
-
-# 6. 樹的數量與性能關係
-train_scores = []
-test_scores = []
-n_trees_range = range(10, 201, 10)
-
-for n_trees in n_trees_range:
-    rf_temp = RandomForestRegressor(
-        n_estimators=n_trees,
-        max_depth=10,
-        random_state=42,
-        n_jobs=-1
-    )
-    rf_temp.fit(X_train, y_train)
-    train_scores.append(rf_temp.score(X_train, y_train))
-    test_scores.append(rf_temp.score(X_test, y_test))
-
-axes[1, 2].plot(n_trees_range, train_scores, label='訓練集')
-axes[1, 2].plot(n_trees_range, test_scores, label='測試集')
-axes[1, 2].set_xlabel('樹的數量')
-axes[1, 2].set_ylabel('R²分數')
-axes[1, 2].set_title('模型性能 vs 樹的數量')
-axes[1, 2].legend()
-axes[1, 2].grid(True, alpha=0.3)
-
-plt.tight_layout()
-plt.show()
-
-# 8. 模型診斷
-print("\n模型診斷:")
-print(f"訓練集樣本數: {len(X_train)}")
-print(f"測試集樣本數: {len(X_test)}")
-print(f"特徵數量: {X.shape[1]}")
-
-# 檢查過擬合
-train_r2 = r2_score(y_train, y_pred_train)
-test_r2 = r2_score(y_test, y_pred_test)
-overfitting_gap = train_r2 - test_r2
-print(f"過擬合差距 (訓練R² - 測試R²): {overfitting_gap:.4f}")
-
-if overfitting_gap > 0.1:
-    print("警告: 模型可能有過擬合問題，建議:")
-    print("  1. 增加樹的最大深度限制")
-    print("  2. 增加min_samples_split和min_samples_leaf")
-    print("  3. 使用更多訓練數據")
-else:
-    print("過擬合情況在可接受範圍內")
-
-# 9. 預測示例
-print("\n預測示例 (測試集前5筆):")
-sample_indices = X_test.index[:5]
-for idx in sample_indices:
-    actual_price = np.expm1(y.loc[idx])
-    predicted_price = np.expm1(rf_model.predict(X.loc[[idx]]))[0]
-    error = predicted_price - actual_price
-    error_percent = (error / actual_price) * 100
-    
-    print(f"實際: {actual_price:,.0f}元, 預測: {predicted_price:,.0f}元, "
-          f"誤差: {error:,.0f}元 ({error_percent:+.1f}%)")
-
-# 10. 儲存模型結果
-results_df = pd.DataFrame({
-    '實際值_原始': y_test_original.values,
-    '預測值_原始': y_pred_test_original,
-    '實際值_log': y_test.values,
-    '預測值_log': y_pred_test,
-    '誤差_原始': y_pred_test_original - y_test_original.values,
-    '誤差百分比': error_percentage
-}, index=y_test.index)
-
-results_df.to_csv('random_forest_predictions.csv', encoding='utf-8-sig')
-print("\n預測結果已儲存為 'random_forest_predictions.csv'")
+if __name__ == '__main__':
+    main()

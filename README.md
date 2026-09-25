@@ -7,6 +7,10 @@
    並測試整合特徵（TotalQualityIndex）的效果。
 2. **台北住宅（內政部不動產實價登錄）**：把相同的建模流程套用到台北市 112–114 年、
    共 12 季的成屋買賣資料，完成資料清理、特徵工程與 Random Forest 預測。
+   課程結束後（2026-09）自我檢查，修正了資料洩漏與誤差指標，並加入時間切分驗證。
+
+> 課程期末繳交的原始版本保留在 [`original`](https://github.com/AlexTsai2004/house-price-prediction/tree/original) 分支；
+> 兩版差異見 [original...main](https://github.com/AlexTsai2004/house-price-prediction/compare/original...main)。
 
 ## 分工
 
@@ -14,7 +18,7 @@
 |---|---|---|
 | 黃柏碩 | Ames 主流程：EDA、特徵重要度與 Top-K 搜尋、TF-DF RF／GBT 模型、Kaggle submission | `ames/house_price.ipynb` |
 | 黃子宸 | Ames 特徵整合：設計 TotalQualityIndex 等整合特徵並重新評估 | `ames/feature_integration.ipynb` |
-| 蔡智翔 | 台北住宅：實價登錄資料合併與清理、特徵工程、Random Forest 建模與評估 | `taipei/` |
+| 蔡智翔 | 台北住宅：實價登錄資料合併與清理、特徵工程、Random Forest 建模與評估，以及 2026-09 修正版 | `taipei/` |
 
 ## 目錄
 
@@ -24,12 +28,13 @@ ames/
   feature_integration.ipynb    加入整合特徵的版本
   data/README.md               Kaggle 資料下載說明
 taipei/
-  README.md                    資料下載與執行步驟
+  README.md                    資料下載、執行步驟、修正內容與結果
   full_data_analyzer_with_plots.py   合併 12 季資料、篩選住家用
   impute_time_data_remove_null.py    時間欄位處理、移除建築完成年月空值
   analyze_residential_data.py        EDA
-  final_process.py                   特徵工程
-  Random_Forest.py                   Random Forest 建模與評估
+  final_process.py                   特徵工程（修正版）
+  Random_Forest.py                   Random Forest 建模與評估（修正版）
+  results/                           修正版指標（metrics.json）與圖表
   analysis/                          EDA 報告與圖表
 ```
 
@@ -45,12 +50,15 @@ taipei/
 
 整合特徵讓 Random Forest 的 RMSE 下降約 2–3%，但對 GBT 沒有幫助。
 
-### 台北住宅（80/20 隨機切分，訓練 35,885 筆、測試 8,972 筆）
+### 台北住宅（修正版，測試集）
 
-| 指標 | 測試集 |
-|---|---|
-| R²（log 尺度） | 0.8898 |
-| R²（原始價格） | 0.8654 |
+| 指標 | 隨機切分 80/20 | 時間切分（≤113 年訓練、114 年測試） |
+|---|---|---|
+| R²（原始價格） | 0.866 | 0.787 |
+| MAPE | 20.0% | 24.2% |
+| 中位數絕對百分比誤差 | 13.0% | 15.9% |
+
+詳細說明見 [`taipei/README.md`](taipei/README.md)。
 
 ## 環境
 
